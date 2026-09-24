@@ -2,6 +2,7 @@
 /**
  * jev-use CLI.
  *
+ *   jev-use install codex     configure Codex MCP, automatic Gate, and routing
  *   jev-use serve             stdio MCP server (Claude Code, Codex, Cursor, ...)
  *   jev-use hook gate         PreToolUse hook adapter (Claude Code & Codex hooks)
  *   jev-use judge [json]      one-shot judgment from argv or stdin (smoke/CI)
@@ -20,6 +21,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createBackend, createServerBackend } from "./backends/index.js";
@@ -31,6 +33,7 @@ import {
   check,
   ESTIMATED_CONFIDENCE_THRESHOLD,
   REPORTED_CONFIDENCE_THRESHOLD,
+  type GateResult,
   type JudgeRequest,
 } from "./protocol.js";
 import { createServer, SERVER_VERSION } from "./server.js";
@@ -40,6 +43,8 @@ interface Args {
   backend?: string;
   threshold?: number;
   json?: string;
+  codex?: boolean;
+  yes?: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -48,12 +53,81 @@ function parseArgs(argv: string[]): Args {
     const argument = argv[i];
     if (argument === "--backend") args.backend = argv[++i];
     else if (argument === "--threshold") args.threshold = Number(argv[++i]);
+    else if (argument === "--codex") args.codex = true;
+    else if (argument === "--yes" || argument === "-y") args.yes = true;
     else if (argument === "--help" || argument === "-h") args.command = ["help"];
     else if (argument === "--version" || argument === "-v") args.command = ["version"];
     else if (argument.startsWith("{")) args.json = argument;
     else args.command.push(argument);
   }
   return args;
+}
+
+type HookHarness = "claude" | "codex";
+type HookOutput = {
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse";
+    permissionDecision: "ask" | "deny";
+    permissionDecisionReason: string;
+  };
+};
+
+/** The two read-only judgment tools exposed by jev-use's own MCP server. */
+const MCP_ALLOW_RULES = ["mcp__jev__jev_judge", "mcp__jev__jev_gate"];
+
+/** Prevent Codex's wildcard PreToolUse hook from gating Jev with Jev again. */
+export function shouldBypassHookGate(
+  event: Record<string, unknown>,
+  harness: HookHarness = "claude",
+): boolean {
+  return harness === "codex" && MCP_ALLOW_RULES.includes(String(event.tool_name ?? ""));
+}
+
+/** Map a typed Jev gate result to the permission vocabulary a harness supports. */
+export function hookDecisionOutput(
+  result: Pick<GateResult, "decision" | "confidence" | "reason">,
+  harness: HookHarness = "claude",
+): HookOutput | undefined {
+  if (result.decision === "allow") return undefined;
+
+  if (result.decision === "deny") {
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: `Jev gate: denied (confidence ${result.confidence.toFixed(2)}).`,
+      },
+    };
+  }
+
+  const reason = result.reason ?? "unsure";
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: harness === "codex" ? "deny" : "ask",
+      permissionDecisionReason:
+        harness === "codex"
+          ? `Jev gate: could not decide safely (${reason}). Codex must review the action or ask the user before retrying.`
+          : `Jev gate: not sure this is safe (${reason}) — please review.`,
+    },
+  };
+}
+
+/** Codex has no `ask` decision, so adapter failures become an explicit handoff. */
+export function hookFailureOutput(
+  message: string,
+  harness: HookHarness = "claude",
+): HookOutput | undefined {
+  if (harness !== "codex") return undefined;
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason:
+        `Jev gate failed before it could decide (${message}). ` +
+        "Codex must review the action or ask the user before retrying.",
+    },
+  };
 }
 
 /**
@@ -142,29 +216,31 @@ function thresholdLine(override?: number): string {
 }
 
 /**
- * PreToolUse hook adapter, shared by Claude Code and Codex (their hook
- * protocols are shape-compatible). Reads the hook event on stdin, asks
- * jev_gate, and emits a permission decision:
+ * PreToolUse hook adapter, shared by Claude Code and Codex. Reads the hook
+ * event on stdin, asks jev_gate, and emits a permission decision:
  *
  *   deny      → permissionDecision "deny"
- *   escalate  → permissionDecision "ask"   (a human or the LLM decides)
+ *   escalate  → Claude: "ask"; Codex: "deny" with a handoff reason
  *   allow     → NO output: fall through to the user's normal permission
  *               flow. The gate only ever tightens, never loosens.
  *
- * A failure BEFORE the call is fail-open (exit 0, no output): no credentials,
- * or stdin that was not a hook event. A failure of the provider itself is not
- * — the engine turns an unreachable backend into an escalate verdict, so a
- * 503, a refused connection or a timeout surfaces as `ask` with the reason
- * `unreachable`. A command nobody could judge is never waved through.
+ * Existing Claude behavior stays fail-open for adapter failures. `--codex`
+ * instead emits a blocking handoff because Codex does not support `ask`;
+ * malformed stdin exits 2. Provider failures already become an escalate
+ * verdict in the engine and follow the same harness-specific mapping.
  */
 async function hookGate(args: Args): Promise<void> {
+  const harness: HookHarness = args.codex ? "codex" : "claude";
   let event: Record<string, unknown>;
   try {
     event = JSON.parse(await readStdin()) as Record<string, unknown>;
   } catch {
     process.stderr.write("jev-use hook: stdin was not hook-event JSON\n");
+    if (harness === "codex") process.exitCode = 2;
     return;
   }
+  if (shouldBypassHookGate(event, harness)) return;
+
   try {
     const { jev } = connect(args);
     const toolInput = event.tool_input ?? {};
@@ -177,24 +253,13 @@ async function hookGate(args: Args): Promise<void> {
       { confidenceThreshold: args.threshold ?? envNumber("JEV_GATE_THRESHOLD") },
     );
 
-    if (result.decision === "allow") return; // stay silent: default flow decides
-
-    const decision = result.decision === "deny" ? "deny" : "ask";
-    const reason =
-      result.decision === "deny"
-        ? `Jev gate: denied (confidence ${result.confidence.toFixed(2)}).`
-        : `Jev gate: not sure this is safe (${result.reason ?? "unsure"}) — please review.`;
-    process.stdout.write(
-      JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: decision,
-          permissionDecisionReason: reason,
-        },
-      }) + "\n",
-    );
+    const output = hookDecisionOutput(result, harness);
+    if (output) process.stdout.write(JSON.stringify(output) + "\n");
   } catch (error) {
-    process.stderr.write(`jev-use hook: fail-open (${String(error)})\n`);
+    const message = error instanceof Error ? error.message : String(error);
+    const output = hookFailureOutput(message, harness);
+    if (output) process.stdout.write(JSON.stringify(output) + "\n");
+    else process.stderr.write(`jev-use hook: fail-open (${String(error)})\n`);
   }
 }
 
@@ -213,9 +278,6 @@ async function judgeOnce(args: Args): Promise<void> {
   process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   process.exitCode = result.escalated ? 3 : 0;
 }
-
-/** The allow rules a harness needs before it may call jev's MCP tools. */
-const MCP_ALLOW_RULES = ["mcp__jev__jev_judge", "mcp__jev__jev_gate"];
 
 /** The settings files a user would put those rules in: their own, then this project's. */
 function claudeSettingsFiles(): string[] {
@@ -306,9 +368,10 @@ async function doctor(args: Args): Promise<void> {
 export const HELP = `jev-use ${SERVER_VERSION} — the typed handoff between your LLM and Jev
 
 usage:
-  jev-use install [claude|codex|pi]      wire the MCP server into your harness (all found, if no target)
+  jev-use install [claude|codex|pi] [-y] configure the harness; Codex gets MCP + Gate + routing
   jev-use serve [--backend name]         stdio MCP server
-  jev-use hook gate [--threshold N]      PreToolUse hook adapter (Claude Code / Codex)
+  jev-use hook gate [--threshold N] [--codex]
+                                        PreToolUse hook adapter (Claude Code / Codex)
   jev-use judge ['{...}']                one-shot JudgeRequest from argv or stdin
   jev-use doctor                         backend + one live round trip + permission rules
 
@@ -316,11 +379,32 @@ backends: typesafe (TYPESAFE_API_KEY) | openrouter (OPENROUTER_API_KEY)
         | vercel (AI_GATEWAY_API_KEY) | mock. Auto-detected from env,
         or forced with --backend / JEV_BACKEND. Model override: JEV_MODEL.
 
-hook gate also reads two env vars: JEV_GATE_THRESHOLD, the confidence to
+hook gate uses Claude-compatible ask by default. Pass --codex to map an
+escalation or adapter failure to a blocking handoff that Codex supports.
+It also reads two env vars: JEV_GATE_THRESHOLD, the confidence to
 escalate below — unset, each answer's confidence source decides, and
 jev-use doctor prints both numbers in effect — and JEV_GATE_STATE, facts the
 hook event cannot carry, appended to every judged state.
 `;
+
+async function confirmCodexInstall(): Promise<boolean> {
+  process.stderr.write(
+    "jev-use will configure the Codex MCP server, install a PreToolUse Gate, " +
+      "and add a managed routing block to ~/.codex/AGENTS.md.\n" +
+      "Existing files are merged and changed files receive a .jev-use.bak backup.\n",
+  );
+  if (!process.stdin.isTTY || !process.stderr.isTTY) {
+    process.stderr.write("codex install needs confirmation; rerun with --yes for non-interactive use.\n");
+    return false;
+  }
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = (await prompt.question("Continue? [y/N] ")).trim().toLowerCase();
+    return answer === "y" || answer === "yes";
+  } finally {
+    prompt.close();
+  }
+}
 
 function envNumber(name: string): number | undefined {
   const value = process.env[name];
@@ -333,7 +417,17 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const [command, subcommand] = args.command;
   try {
-    if (command === "install") process.exitCode = runInstall(subcommand);
+    if (command === "install") {
+      const includesCodex = subcommand === undefined || subcommand === "codex";
+      if (includesCodex && !args.yes && !(await confirmCodexInstall())) {
+        process.stderr.write("codex installation cancelled.\n");
+        return;
+      }
+      process.exitCode = runInstall(subcommand, {
+        nodePath: process.execPath,
+        cliPath: fileURLToPath(import.meta.url),
+      });
+    }
     else if (command === "serve") await serve(args);
     else if (command === "hook" && subcommand === "gate") await hookGate(args);
     else if (command === "judge") await judgeOnce(args);

@@ -7,7 +7,14 @@
 
 import { describe, expect, it } from "vitest";
 import type { BackendRequest, BackendResponse, JevBackend } from "../src/backends/types.js";
-import { effectiveThresholds, gateState, HELP } from "../src/cli.js";
+import {
+  effectiveThresholds,
+  gateState,
+  HELP,
+  hookDecisionOutput,
+  hookFailureOutput,
+  shouldBypassHookGate,
+} from "../src/cli.js";
 import { judge } from "../src/judge.js";
 import {
   ESTIMATED_CONFIDENCE_THRESHOLD,
@@ -67,6 +74,62 @@ describe("gateState", () => {
         INSTRUCTION,
       ].join("\n"),
     );
+  });
+});
+
+describe("Codex hook decisions", () => {
+  it("bypasses the automatic gate for Jev's own MCP tools only", () => {
+    expect(shouldBypassHookGate({ tool_name: "mcp__jev__jev_judge" }, "codex")).toBe(true);
+    expect(shouldBypassHookGate({ tool_name: "mcp__jev__jev_gate" }, "codex")).toBe(true);
+    expect(shouldBypassHookGate({ tool_name: "mcp__filesystem__read_file" }, "codex")).toBe(false);
+    expect(shouldBypassHookGate({ tool_name: "mcp__jev__future_tool" }, "codex")).toBe(false);
+    expect(shouldBypassHookGate({ tool_name: "mcp__jev__jev_judge" }, "claude")).toBe(false);
+  });
+
+  it("keeps an explicit allow silent so Codex's normal permission flow decides", () => {
+    expect(
+      hookDecisionOutput(
+        { decision: "allow", confidence: 0.98 },
+        "codex",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("maps an escalation to deny because Codex does not support ask", () => {
+    expect(
+      hookDecisionOutput(
+        { decision: "escalate", confidence: 0, reason: "unreachable" },
+        "codex",
+      ),
+    ).toEqual({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason:
+          "Jev gate: could not decide safely (unreachable). Codex must review the action or ask the user before retrying.",
+      },
+    });
+  });
+
+  it("keeps Claude's existing escalation-to-ask behavior", () => {
+    expect(
+      hookDecisionOutput(
+        { decision: "escalate", confidence: 0.3, reason: "unsure" },
+        "claude",
+      )?.hookSpecificOutput.permissionDecision,
+    ).toBe("ask");
+  });
+
+  it("turns Codex adapter failures into a blocking decision", () => {
+    expect(hookFailureOutput("backend initialization failed", "codex")).toEqual({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason:
+          "Jev gate failed before it could decide (backend initialization failed). Codex must review the action or ask the user before retrying.",
+      },
+    });
+    expect(hookFailureOutput("backend initialization failed", "claude")).toBeUndefined();
   });
 });
 

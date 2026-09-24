@@ -72,9 +72,10 @@ One proposed action, one risk check.
 Returns `{decision: allow | deny | escalate, confidence, confidenceFrom, hint}` — one
 allow/deny `choice` under the hood, `escalate` when confidence falls below
 the threshold. **`allow` stays silent and falls through to your normal
-permission flow — the gate can never grant anything, only deny or ask — and a
-provider that is down escalates to `ask` with the reason `unreachable`, never
-to `allow`.**
+permission flow — the gate can never grant anything. A provider that is down
+escalates with the reason `unreachable`, never to `allow`.** Claude's default
+adapter maps escalation to `ask`; `hook gate --codex` maps it to a blocking
+handoff because Codex does not support `ask`.
 
 The action is the one part of the judged state you did not write, so its
 credentials are redacted before the call ([src/redact.ts](../src/redact.ts)):
@@ -196,7 +197,7 @@ live check.
 ```
 jev-use install [claude|codex|pi]   wire the server into your harness via its own CLI (all found, if no target)
 jev-use serve                 stdio MCP server
-jev-use hook gate             PreToolUse hook adapter (Claude Code / Codex)
+jev-use hook gate [--codex]   PreToolUse hook adapter (Claude Code / Codex)
 jev-use judge ['{...}']       one-shot JudgeRequest from argv or stdin
 jev-use doctor                backend resolution + one live round trip
 ```

@@ -32,6 +32,18 @@ Jev。
 npx -y jev-use install    # 自动配置 Claude Code / Codex / pi——检测到哪个装哪个
 ```
 
+只配置 Codex：
+
+```bash
+jev-use install codex
+```
+
+安装器会在写入前提示确认，并自动完成 MCP、PreToolUse Gate 和全局
+`AGENTS.md` 路由规则；它会合并已有配置并为发生变化的文件生成
+`.jev-use.bak`。无人值守安装可加 `--yes`。安装完成后，在终端启动 Codex
+CLI，并在 CLI 内执行 `/hooks` 审核、信任这条 Hook，然后重启桌面版。
+`/hooks` 不是桌面聊天输入框命令。这个独立的安全确认不会被安装器绕过。
+
 在 agent 运行的环境里配一个 key（`JEV_BACKEND=mock` 可无 key 干跑）：
 
 | 供应商 | 环境变量 |

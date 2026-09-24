@@ -35,6 +35,20 @@ all numbers, methodology, variance and caveats:
 npx -y jev-use install    # wires Claude Code, Codex, and pi — whichever it finds
 ```
 
+Codex only:
+
+```bash
+jev-use install codex
+```
+
+The installer asks before writing, then configures the MCP server, the
+PreToolUse Gate, and a managed global `AGENTS.md` routing block. It merges
+existing files and creates `.jev-use.bak` backups for changed files. Pass
+`--yes` for reviewed non-interactive installation. Afterwards, start the Codex
+CLI and open `/hooks` there to review and trust the exact hook, then restart the
+desktop app. `/hooks` is a CLI interaction, not a desktop-chat slash command.
+The installer does not bypass that independent safety check.
+
 Set one key in the environment your agent runs in (`JEV_BACKEND=mock` for
 a keyless dry run):
 

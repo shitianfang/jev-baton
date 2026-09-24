@@ -41,15 +41,17 @@ prints which variable was found, never its value.
 
 ## The command gate
 
-`jev_gate` and the PreToolUse hook are **opt-in** and can only ever return
-deny or ask — they cannot grant a permission the harness would not otherwise
-give.
+`jev_gate` and the PreToolUse hook are **opt-in**. The hook can deny, ask on
+Claude Code, or stay silent after an explicit allow; it cannot grant a
+permission the harness would not otherwise give. Codex mode uses a blocking
+handoff instead of `ask`, which Codex does not support.
 
 When the backend is unreachable, the gate does **not** fall back to
 allowing. The question is returned to the LLM with the typed reason
 `unreachable`, so a command that could not be judged is never waved through
-on the judge's behalf. The same holds for `unsure`: a verdict below the
-confidence threshold escalates rather than resolving to a default.
+on the judge's behalf. Claude asks; Codex blocks that attempt and returns the
+reason to the main agent for review. The same holds for `unsure`: a verdict
+below the confidence threshold escalates rather than resolving to a default.
 
 Treat the gate as defence in depth, not as a sandbox. It is a model
 judging a command, it has measured failure modes (see `bench/RESULTS.md`),
